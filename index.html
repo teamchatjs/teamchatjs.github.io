@@ -625,7 +625,6 @@ body {
     text-decoration: underline;
 }
 
-/* Edit mode */
 .edit-box {
     margin-top: 4px;
     border: 1px solid #1164A3;
@@ -723,7 +722,6 @@ body {
     padding: 5px 0;
 }
 
-/* Composer attachments + edit attachments share styles */
 .composer-attachments,
 .edit-attachments {
     display: flex;
@@ -974,14 +972,12 @@ body {
     z-index: 99;
 }
 
-/* Tablet */
 @media (max-width: 900px) {
     .sidebar {
         width: 240px;
     }
 }
 
-/* Mobile */
 @media (max-width: 768px) {
     .sidebar {
         position: fixed;
@@ -1130,7 +1126,6 @@ body {
     }
 }
 
-/* Small mobile */
 @media (max-width: 380px) {
     .sidebar {
         width: 260px;
@@ -1190,7 +1185,6 @@ body {
     }
 }
 
-/* Landscape phones */
 @media (orientation: landscape) and (max-height: 500px) {
     .messages {
         padding: 8px 12px;
@@ -1293,6 +1287,15 @@ body {
     color: #666;
     font-size: 13px;
     margin-bottom: 16px;
+}
+
+.modal label {
+    display: block;
+    font-size: 12px;
+    color: #555;
+    font-weight: 600;
+    margin-bottom: 4px;
+    text-align: left;
 }
 
 .modal input {
@@ -1473,7 +1476,7 @@ body {
         </div>
 
         <div class="sidebar-footer">
-            <button class="footer-btn" onclick="changeTeam()" title="Switch to another team">
+            <button class="footer-btn" onclick="changeTeam()" title="Switch team or rename">
                 🔄 Change Team
             </button>
             <button class="footer-btn" onclick="copyRoomLink(event)" title="Copy invite link">
@@ -1523,11 +1526,14 @@ body {
 <div class="modal-overlay" id="teamModal">
     <div class="modal">
         <h2>Switch Team</h2>
-        <p>Enter the team code you want to switch to. Your local data for the current team will be kept.</p>
-        <input type="text" id="newTeamInput" placeholder="New team code..." maxlength="30">
+        <p>Update your name or switch to another team. Your local data will be kept.</p>
+        <label for="newNameInput">Your name</label>
+        <input type="text" id="newNameInput" placeholder="Your name..." maxlength="20" autocomplete="nickname">
+        <label for="newTeamInput">Team code</label>
+        <input type="text" id="newTeamInput" placeholder="Team code..." maxlength="30" autocomplete="off">
         <div class="modal-buttons">
             <button class="btn-secondary" onclick="closeTeamModal()">Cancel</button>
-            <button class="btn-primary" onclick="confirmChangeTeam()">Switch</button>
+            <button class="btn-primary" onclick="confirmChangeTeam()">Apply</button>
         </div>
     </div>
 </div>
@@ -1574,6 +1580,93 @@ const SYNC_THRESHOLD_MS = 800;
 let syncingTimer = null;
 let statusResetTimer = null;
 
+/* ========== IndexedDB wrapper ========== */
+const DB_NAME = 'teamchat_db';
+const DB_VERSION = 1;
+const STORE_APP = 'app';      // for global app state (currentUser, currentRoom)
+const STORE_TEAMS = 'teams';  // for per-team data, keyed by room name
+
+let _dbPromise = null;
+
+function openDB() {
+    if (_dbPromise) return _dbPromise;
+    _dbPromise = new Promise((resolve, reject) => {
+        if (!('indexedDB' in window)) {
+            reject(new Error('IndexedDB not supported'));
+            return;
+        }
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_APP)) {
+                db.createObjectStore(STORE_APP);
+            }
+            if (!db.objectStoreNames.contains(STORE_TEAMS)) {
+                db.createObjectStore(STORE_TEAMS);
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+    return _dbPromise;
+}
+
+async function idbGet(storeName, key) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readonly');
+        const store = tx.objectStore(storeName);
+        const req = store.get(key);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function idbSet(storeName, key, value) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        const store = tx.objectStore(storeName);
+        const req = store.put(value, key);
+        req.onsuccess = () => resolve(true);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+/* ========== Migration from localStorage ========== */
+async function migrateFromLocalStorage() {
+    try {
+        const migratedFlag = await idbGet(STORE_APP, '_migrated');
+        if (migratedFlag) return;
+        
+        // Migrate app state
+        const savedState = localStorage.getItem('teamchat_state') || localStorage.getItem('slack_state');
+        if (savedState) {
+            try {
+                const s = JSON.parse(savedState);
+                await idbSet(STORE_APP, 'state', s);
+            } catch(e) {}
+        }
+        
+        // Migrate team data
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && key.startsWith('teamchat_team_')) {
+                const room = key.substring('teamchat_team_'.length);
+                try {
+                    const data = JSON.parse(localStorage.getItem(key));
+                    await idbSet(STORE_TEAMS, room, data);
+                } catch(e) {}
+            }
+        }
+        
+        await idbSet(STORE_APP, '_migrated', true);
+    } catch(e) {
+        console.warn('Migration failed:', e);
+    }
+}
+
+/* ========== Remote sync ========== */
 const storage = {
     get: async (key) => {
         const res = await fetch(`https://textdb.online/${key}`, {cache: 'no-store'});
@@ -1599,25 +1692,30 @@ function getRoomKey() {
     return 'teamchat_' + state.currentRoom.replace(/[^a-z0-9-]/gi, '_').toLowerCase();
 }
 
-function loadState() {
-    const saved = localStorage.getItem('teamchat_state');
-    if (saved) {
-        try {
-            const s = JSON.parse(saved);
-            state = {...state, ...s};
-        } catch(e) {}
+async function loadState() {
+    try {
+        const s = await idbGet(STORE_APP, 'state');
+        if (s) state = {...state, ...s};
+    } catch(e) {
+        console.warn('loadState error:', e);
     }
 }
 
-function saveState() {
+async function saveState() {
     try {
-        localStorage.setItem('teamchat_state', JSON.stringify(state));
+        const snapshot = {
+            currentUser: state.currentUser,
+            currentRoom: state.currentRoom,
+            currentChat: state.currentChat,
+            chatType: state.chatType
+        };
+        await idbSet(STORE_APP, 'state', snapshot);
     } catch(e) {
         console.warn('State save failed:', e);
     }
 }
 
-function saveTeamData() {
+async function saveTeamData() {
     if (!state.currentRoom) return;
     try {
         const teamData = {
@@ -1627,19 +1725,19 @@ function saveTeamData() {
             currentChat: state.currentChat,
             chatType: state.chatType
         };
-        localStorage.setItem('teamchat_team_' + state.currentRoom, JSON.stringify(teamData));
+        await idbSet(STORE_TEAMS, state.currentRoom, teamData);
     } catch(e) {
         console.warn('Team save failed:', e);
-        showToast('Local storage full — older data may not persist', true);
+        showToast('Storage error — data may not persist', true);
     }
 }
 
-function loadTeamData(room) {
-    const data = localStorage.getItem('teamchat_team_' + room);
-    if (data) {
-        try { return JSON.parse(data); } catch(e) {}
+async function loadTeamData(room) {
+    try {
+        return await idbGet(STORE_TEAMS, room);
+    } catch(e) {
+        return null;
     }
-    return null;
 }
 
 async function fetchRemote() {
@@ -1766,8 +1864,8 @@ async function syncRemote() {
         state.users = merged.users;
         state.messages = merged.messages;
         
-        saveState();
-        saveTeamData();
+        await saveState();
+        await saveTeamData();
         const pushed = await pushRemote(merged);
         if (!pushed) hadError = true;
         
@@ -1789,7 +1887,7 @@ async function forceSync() {
     await syncRemote();
 }
 
-function login() {
+async function login() {
     const nameInput = document.getElementById('usernameInput');
     const roomInput = document.getElementById('roomInput');
     const name = nameInput.value.trim();
@@ -1798,18 +1896,18 @@ function login() {
     if (!name) { nameInput.focus(); return; }
     if (!room) { roomInput.focus(); return; }
     
-    enterRoom(name, room);
+    await enterRoom(name, room);
 }
 
-function enterRoom(name, room) {
+async function enterRoom(name, room) {
     if (state.currentRoom && state.currentRoom !== room) {
-        saveTeamData();
+        await saveTeamData();
     }
     
     state.currentUser = name;
     state.currentRoom = room;
     
-    const teamData = loadTeamData(room);
+    const teamData = await loadTeamData(room);
     if (teamData) {
         state.channels = teamData.channels || ['general', 'random'];
         state.users = teamData.users || [];
@@ -1835,8 +1933,8 @@ function enterRoom(name, room) {
         existing.lastSeen = Date.now();
     }
     
-    saveState();
-    saveTeamData();
+    await saveState();
+    await saveTeamData();
     
     document.getElementById('loginScreen').style.display = 'none';
     document.getElementById('app').style.display = 'flex';
@@ -1847,20 +1945,34 @@ function enterRoom(name, room) {
 }
 
 function changeTeam() {
-    document.getElementById('newTeamInput').value = '';
+    const nameEl = document.getElementById('newNameInput');
+    const teamEl = document.getElementById('newTeamInput');
+    nameEl.value = state.currentUser || '';
+    teamEl.value = state.currentRoom || '';
     document.getElementById('teamModal').classList.add('show');
-    setTimeout(() => document.getElementById('newTeamInput').focus(), 100);
+    setTimeout(() => teamEl.focus(), 100);
 }
 
 function closeTeamModal() {
     document.getElementById('teamModal').classList.remove('show');
 }
 
-function confirmChangeTeam() {
-    const input = document.getElementById('newTeamInput');
-    const newRoom = input.value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
-    if (!newRoom) { input.focus(); return; }
-    if (newRoom === state.currentRoom) { closeTeamModal(); return; }
+async function confirmChangeTeam() {
+    const nameInput = document.getElementById('newNameInput');
+    const teamInput = document.getElementById('newTeamInput');
+    const newName = nameInput.value.trim();
+    const newRoom = teamInput.value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    
+    if (!newName) { nameInput.focus(); return; }
+    if (!newRoom) { teamInput.focus(); return; }
+    
+    const nameChanged = newName !== state.currentUser;
+    const roomChanged = newRoom !== state.currentRoom;
+    
+    if (!nameChanged && !roomChanged) {
+        closeTeamModal();
+        return;
+    }
     
     closeTeamModal();
     
@@ -1869,12 +1981,34 @@ function confirmChangeTeam() {
     editingAttachments = [];
     renderComposerAttachments();
     
-    document.getElementById('messages').innerHTML = `<div class="empty-state"><h2>👋 Welcome!</h2><p>Loading team #${newRoom}...</p></div>`;
-    document.getElementById('inputArea').style.display = 'none';
-    document.getElementById('chatTitle').textContent = 'Select a channel';
-    document.getElementById('chatInfo').textContent = '';
-    
-    enterRoom(state.currentUser, newRoom);
+    if (roomChanged) {
+        document.getElementById('messages').innerHTML = `<div class="empty-state"><h2>👋 Welcome!</h2><p>Loading team #${escapeHtml(newRoom)}...</p></div>`;
+        document.getElementById('inputArea').style.display = 'none';
+        document.getElementById('chatTitle').textContent = 'Select a channel';
+        document.getElementById('chatInfo').textContent = '';
+        await enterRoom(newName, newRoom);
+    } else {
+        // Only name changed in same room
+        state.currentUser = newName;
+        const existing = state.users.find(u => u.name === newName);
+        if (!existing) {
+            state.users.push({
+                name: newName,
+                avatar: newName[0].toUpperCase(),
+                lastSeen: Date.now()
+            });
+        } else {
+            existing.lastSeen = Date.now();
+        }
+        document.getElementById('currentUser').textContent = newName;
+        await saveState();
+        await saveTeamData();
+        renderChannels();
+        renderUsers();
+        renderMessages();
+        await syncRemote();
+        showToast('Name updated to ' + newName);
+    }
 }
 
 function copyRoomLink(ev) {
@@ -1940,14 +2074,15 @@ function renderUsers() {
         });
 }
 
-function selectChat(chat, type) {
+async function selectChat(chat, type) {
     state.currentChat = chat;
     state.chatType = type;
     editingMessageId = null;
     editingAttachments = [];
     revealedDeleted.clear();
     pendingAttachments = [];
-    saveTeamData();
+    await saveTeamData();
+    await saveState();
     
     document.getElementById('chatTitle').innerHTML = type === 'channel' 
         ? `<span style="opacity:0.7">#</span> ${escapeHtml(chat)}`
@@ -2338,8 +2473,7 @@ async function saveEdit(msgId) {
     editingText = '';
     editingAttachments = [];
     
-    saveState();
-    saveTeamData();
+    await saveTeamData();
     renderMessages();
     await syncRemote();
 }
@@ -2387,8 +2521,7 @@ async function performDelete() {
     pendingDeleteId = null;
     document.getElementById('confirmModal').classList.remove('show');
     
-    saveState();
-    saveTeamData();
+    await saveTeamData();
     renderMessages();
     await syncRemote();
 }
@@ -2512,8 +2645,7 @@ async function sendMessage() {
     pendingAttachments = [];
     renderComposerAttachments();
     
-    saveState();
-    saveTeamData();
+    await saveTeamData();
     renderMessages();
     
     const container = document.getElementById('messages');
@@ -2522,15 +2654,14 @@ async function sendMessage() {
     await syncRemote();
 }
 
-function addChannel() {
+async function addChannel() {
     const name = prompt('Channel name:');
     if (!name) return;
     const clean = name.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
     if (!clean) return;
     if (!state.channels.includes(clean)) {
         state.channels.push(clean);
-        saveState();
-        saveTeamData();
+        await saveTeamData();
         renderChannels();
         syncRemote();
     }
@@ -2579,6 +2710,10 @@ document.getElementById('usernameInput').addEventListener('keypress', e => {
 
 document.getElementById('roomInput').addEventListener('keypress', e => {
     if (e.key === 'Enter') login();
+});
+
+document.getElementById('newNameInput').addEventListener('keypress', e => {
+    if (e.key === 'Enter') document.getElementById('newTeamInput').focus();
 });
 
 document.getElementById('newTeamInput').addEventListener('keypress', e => {
@@ -2670,7 +2805,6 @@ document.addEventListener('keydown', e => {
     }
 });
 
-// Close sidebar on swipe
 let touchStartX = 0;
 let touchStartY = 0;
 document.addEventListener('touchstart', e => {
@@ -2695,32 +2829,44 @@ document.addEventListener('touchend', e => {
     }
 }, {passive: true});
 
-const urlParams = new URLSearchParams(window.location.search);
-const urlRoom = urlParams.get('room');
-
-if (localStorage.getItem('slack_state') && !localStorage.getItem('teamchat_state')) {
-    localStorage.setItem('teamchat_state', localStorage.getItem('slack_state'));
-}
-
-loadState();
-
-if (urlRoom && (!state.currentRoom || state.currentRoom !== urlRoom)) {
-    document.getElementById('roomInput').value = urlRoom;
-    if (state.currentUser) {
-        document.getElementById('usernameInput').value = state.currentUser;
+/* ========== Boot ========== */
+(async function boot() {
+    try {
+        await migrateFromLocalStorage();
+        await loadState();
+    } catch(e) {
+        console.warn('Boot error:', e);
     }
-    document.getElementById('usernameInput').focus();
-} else if (state.currentUser && state.currentRoom) {
-    document.getElementById('loginScreen').style.display = 'none';
-    document.getElementById('app').style.display = 'flex';
-    document.getElementById('currentUser').textContent = state.currentUser;
-    document.getElementById('roomName').textContent = '# ' + state.currentRoom;
-    initApp();
-} else {
-    document.getElementById('usernameInput').focus();
-}
+    
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlRoom = urlParams.get('room');
+    
+    if (urlRoom && (!state.currentRoom || state.currentRoom !== urlRoom)) {
+        document.getElementById('roomInput').value = urlRoom;
+        if (state.currentUser) {
+            document.getElementById('usernameInput').value = state.currentUser;
+        }
+        document.getElementById('usernameInput').focus();
+    } else if (state.currentUser && state.currentRoom) {
+        // Load team data for current room
+        const teamData = await loadTeamData(state.currentRoom);
+        if (teamData) {
+            state.channels = teamData.channels || ['general', 'random'];
+            state.users = teamData.users || [];
+            state.messages = teamData.messages || {};
+        }
+        document.getElementById('loginScreen').style.display = 'none';
+        document.getElementById('app').style.display = 'flex';
+        document.getElementById('currentUser').textContent = state.currentUser;
+        document.getElementById('roomName').textContent = '# ' + state.currentRoom;
+        initApp();
+    } else {
+        document.getElementById('usernameInput').focus();
+    }
+})();
 
 window.addEventListener('beforeunload', () => {
+    // Fire-and-forget saves (async not awaited here)
     saveState();
     saveTeamData();
 });
